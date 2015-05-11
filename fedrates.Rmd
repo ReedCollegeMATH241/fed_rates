@@ -1,0 +1,328 @@
+---
+title: "Fed Rates"
+author: "Liam Bowcock"
+date: "Tuesday, May 05, 2015"
+output: html_document
+---
+
+##Introduction
+
+The purpose of this project is to predict changes in the federal funds rate through text mining. The rate, which is indirectly set by the Federal Reserve, influences the interest rate on loans and has an effect on the financial markets. This widespread effect is because the federal funds rate is essentially the interest rate that banks with accounts at the Federal Reserve loan money to each other at, and has a trickle down effect to the rest of the economy through lending and investment returns. If a predictive model can be built such that we can predict interest rate changes before they occur, there stands to be a fairly large monetary gain, either in the financial markets or through securing a loan at a lower interest rate. 
+
+The data used to fit the linear model are 120 transcripts of the [Federal Open Market Committee](http://www.federalreserve.gov/monetarypolicy/fomchistorical2009.htm), the group within the Fed that actually sets the target rate. Meetings of the FOMC occur approximately every 7 weeks and are posted in advance, so there is no need to predict <i>when</i> the next rate change will happen, only how much the rate will change. The transcripts used are from February 1995 to December 2009, each approximately 100 to 200 pages in length. The transcripts have been broken down into words, with frequencies compiled for each transcript, then words that looked like they would have predictive power (e.g. growth, negative, weak, aggressive, etc) were selected and their counts used to predict the interest rate change at the <i>next</i> meeting. 
+
+The rates used are the [effective rates](http://www.federalreserve.gov/releases/h15/data.htm), which are the rates the banks actually traded to each other at, rather than the target rate set by the Fed - [research](http://www.economics-finance.org/jefe/fin/KeaslerGoffpaper.pdf) indicates that the target rate and the effective rate are often very close to one another, so effective rates are a suitable proxy. The monthly (as opposed to daily) rate is used, as it represents a weighted average of daily rates for that month, and is less likely to experience fluctuations that the daily rate undergoes. 
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+
+library(dplyr)
+library(tm) 
+library(ggplot2) 
+library(SnowballC) 
+library(scales) 
+library(stringr)
+library(lubridate)
+
+```
+
+##Text Analysis
+
+Text analysis was done using the tm R package. Transcripts were converted to lower case, numbers and punctuation were removed as well as stopwords, and then the document was stemmed so that words that convey a similar meaning (worse, worst, worsening, etc) are counted as the same word.
+
+```{r, echo = FALSE, chache = TRUE}
+
+#Creating the DocumentTermMatrix - words and the frequencies by document.
+
+#Convert pdf to text and put into a corpus. I use xpdf(http://www.foolabs.com/xpdf/download.html)) to convert pdf to text; it is included in the project file.
+
+cname <- file.path(".", "corpus")
+docs <- Corpus(DirSource(cname), readerControl = list(reader=readPDF))
+
+#Clean up the corpus
+docs <- tm_map(docs, content_transformer(tolower))
+docs <- tm_map(docs, removeNumbers)
+docs <- tm_map(docs, removePunctuation)
+docs <- tm_map(docs, removeWords, stopwords("english"))
+docs <- tm_map(docs, stripWhitespace)
+docs <- tm_map(docs, stemDocument)
+
+#Get a document term matrix (rows are docs, cols are terms)
+dtm <- DocumentTermMatrix(docs)
+
+#Remove sparse terms (words that don't occur often) to reduce the size of the matrix
+dtms <- removeSparseTerms(dtm, 0.1)
+
+#Convert to data frame for ease
+dtms.df <- data.frame(as.matrix(dtms))
+
+
+
+###
+
+
+
+#Calculating interest rate at the next meeting
+
+#Pulls meeting dates (121 total)
+meeting.date <- dir(cname) %>%
+  str_sub(., start=5, end = 12) %>% 
+  ymd() 
+
+#Loads effective rates and cleans it up, grabbing 1995 onwards
+eff.rate <- read.csv("fed_eff_rate_monthly.csv", header = TRUE)
+eff.rate <- eff.rate %>% 
+  tbl_df() %>%
+  rename(avg.rate = `RIFSPFF_N.M`, date = `Time.Period`) %>%
+  mutate(date = parse_date_time(date, "%Y %m!")) %>%
+  slice(487:730)
+
+eff.rate.change <- eff.rate %>%
+  mutate(next.avg.rate = lead(avg.rate), change = next.avg.rate - avg.rate)
+
+#Pull rates for the next meeting (the weighted effective rate for the month after the meeting).
+next.month <- ceiling_date(meeting.date, "month") %>% 
+  data.frame() %>% 
+  rename(., date = `.`)
+
+next.mtg.rate <- left_join(next.month, eff.rate, by = "date")
+
+#Final rate data frame - we'll use this in the regression along with word counts to predict rate changes
+mtg.rate <- data.frame(mtg.date = meeting.date, mtg.rate = next.mtg.rate$avg.rate) %>%
+  mutate(next.mtg.rate = lead(mtg.rate), change = next.mtg.rate - mtg.rate) %>% 
+  slice(1:120)
+
+```
+
+##EDA
+
+Let's take a look at the monthly rates for the last 20 years:
+
+```{r, echo=FALSE}
+
+ggplot(eff.rate, aes(x = date, y = avg.rate)) +
+  geom_line(size = 1) +
+  ylab("Monthly Effective Rate (%)") +
+  xlab("Date")
+
+```
+
+From this graph, we can clearly see that rates rose during the DotCom bubble (~2000) and the Housing bubble (2005-2007), only to drop precipitously as those bubbles popped. An important observation to note is that rates have been just above zero for approximately 6 years - we'll come back to that after we fit the model.
+
+Let's take a look at what we'll actually be predicting - changes in the effective rate:
+
+```{r,echo=FALSE}
+
+#CHange in rates over time. Important to note that drops are often sharper than increases.
+ggplot(mtg.rate, aes(x = mtg.date, y = change)) +
+  geom_line(size = 0.6) +
+  xlab("Date") +
+  ylab("Change in Monthly Effective Rate (%)")
+
+
+```
+
+Notably, changes downward are much sharper than those upward. During the bubbles mentioned above, we can see interest rates slowly crept upward, but when the bubbles popped the drop was sharp.
+
+##Fitting the Model 
+
+In choosing words to act as predictors, the process was fairly rudimentary. Words were picked using two categories: frequency and connotation. There needed to be enough instances of the word in order for it to have enough predictive power for any transcript the model processed. The findFreqTerms command in the tm package was used to pick out words that occurred at least 1000 times over the corpus. Given these frequent words, predictor variables were chosen based on connotation. Words like "unemployment" or "inflation" have impacts on monetary policy, but given the bag-of-words approach, context isn't present. As a result, adjectives or other words were selected instead, such as "bad," "expand,""avoid," "sharp," "wrong," etc. Multiple models were fitted, each starting with approximatel 20 terms; the term with the largest p-value was eliminated and the model was re-fit. This was done until all of the terms left were below the 0.05 significance level. The intercept was forced through zero on the basis that we will always know the most recent rate, so what we really care about is a change from that most recent rate. In addition, the model predicts better with an intercept of zero, as we shall see later.
+
+
+```{r, echo = FALSE}
+#Grabs words of interest
+words.of.int <- dtms.df %>%
+  select(weak, expand, aggress, sharp, wors, robust) %>%
+  slice(1:120)
+
+#Dataframe that we will use to fit the model
+reg.df <- bind_cols(mtg.rate, words.of.int)
+
+#Fit two models, one with forcing the intercept through zero.
+rates <- lm(data = reg.df,change ~ -1 + weak + expand + aggress + sharp + wors + robust)
+
+
+```
+
+Below we have the coefficients for the model:
+
+```{r, echo = FALSE}
+
+coefficients(rates)
+
+```
+
+From above, we can see, weak, sharp, and wors have a negative effect on the interest rate change for each additional word count, all other things being constant. Likewise, expand, aggress, and robust show a positive increase in the change for each additional word. Explicitly, for additional instance of the word weak, the change in the rate will be 0.0066% less; the other interpretations follows similarly.
+
+We also look at the corresponding confidence intervals for effect sizes:
+
+```{r, echo=FALSE}
+
+confint(rates)
+
+```
+
+Notably, only weak has a tight confidence interval; the others are fairly large, with effect sizes ranging from five ten-thousandths of a percent to a tenth of a percent in the case of aggress. The wider the interval, the less reliable the effect of the predictor, indicating that the last five are not nearly as reliable as weak. 
+
+In addition, we check the residuals to make sure the assumptions of the linear model are not violated:
+
+```{r, echo = FALSE}
+
+ggplot(rates, aes(x = fitted(rates), y = residuals(rates))) +
+  geom_point() +
+  geom_hline(y = 0) +
+  xlab("Fitted") +
+  ylab("Residuals")
+
+```
+
+There is constant variance along the fitted values, indicating that the linear model is not a bad choice for the data.
+
+## Model Check 
+
+To check the model, we'll use it to predict interest rate changes in 2010 through 2015 based on word counts from minutes of the FOMC meetings (as full transcripts are only released 5 years after the meeting date) as well as FOMC press conference transcripts that occur quarterly after meetings. My measure of accuracy is the actual rate minus the predicted rate: postive values will indicated the prediction was too low and negative values will indicate the prediction was too high. 
+
+```{r, cache=TRUE, echo = FALSE}
+
+#Below I load in more text data from minutes and press conference transcripts.
+
+#Convert pdf to text and put into a corpus. I use xpdf(http://www.foolabs.com/xpdf/download.html)) to convert pdf to text
+press.conf.path <- file.path(".", "pressconf")
+press.conf <- Corpus(DirSource(press.conf.path), readerControl = list(reader=readPDF))
+
+#Clean up the corpus
+press.conf <- tm_map(press.conf, content_transformer(tolower))
+press.conf <- tm_map(press.conf, removeNumbers)
+press.conf <- tm_map(press.conf, removePunctuation)
+press.conf <- tm_map(press.conf, removeWords, stopwords("english"))
+press.conf <- tm_map(press.conf, stripWhitespace)
+press.conf <- tm_map(press.conf, stemDocument)
+
+
+#Get a document term matrix (rows are docs, cols are terms)
+#Will be useful for regression, pick out columns of words and regress on them.
+dtm.press.conf <- DocumentTermMatrix(press.conf)
+
+#Remove sparse terms to reduce the size of the matrix
+dtms.press.conf <- removeSparseTerms(dtm.press.conf, 0.1)
+
+#Convert to data frame for ease
+dtms.df.press.conf <- data.frame(as.matrix(dtms.press.conf))
+
+###
+
+#Convert pdf to text and put into a corpus. I use xpdf(http://www.foolabs.com/xpdf/download.html)) to convert pdf to text
+minutes.path <- file.path(".", "minutes")
+minutes <- Corpus(DirSource(minutes.path), readerControl = list(reader=readPDF))
+
+#Clean up the corpus
+minutes <- tm_map(minutes, content_transformer(tolower))
+minutes <- tm_map(minutes, removeNumbers)
+minutes <- tm_map(minutes, removePunctuation)
+minutes <- tm_map(minutes, removeWords, stopwords("english"))
+minutes <- tm_map(minutes, stripWhitespace)
+minutes <- tm_map(minutes, stemDocument)
+
+
+#Get a document term matrix (rows are docs, cols are terms)
+#Will be useful for regression, pick out columns of words and regress on them.
+dtm.minutes <- DocumentTermMatrix(minutes)
+
+#Remove sparse terms to reduce the size of the matrix
+dtms.minutes <- removeSparseTerms(dtm.minutes, 0.1)
+
+#Convert to data frame for ease
+dtms.df.minutes <- data.frame(as.matrix(dtms.minutes))
+
+#####
+
+#Grabs dates for meetings after the fitted time
+minute.date <- dir(minutes.path) %>%
+  str_sub(., start=12, end = 19) %>% 
+  ymd() 
+
+#Pull rates for the next meeting (the weighted effective rate for the month after the meeting).
+next.month_minutes <- ceiling_date(minute.date, "month") %>% 
+  data.frame() %>% 
+  rename(., date = `.`)
+
+#Actual rate changes for each meeting.
+next.mtg.rate_minutes <- left_join(next.month_minutes, eff.rate.change, by = "date") %>% slice(1:40)
+
+###
+#We do the same as above, except with the press conference dates.
+
+#Grabs dates for meetings after the fitted time
+pc.date <- dir(press.conf.path) %>%
+  str_sub(., start=13, end = 20) %>% 
+  ymd() 
+
+#Pull rates for the next meeting (the weighted effective rate for the month after the meeting).
+next.month_pc <- ceiling_date(pc.date, "month") %>% 
+  data.frame() %>% 
+  rename(., date = `.`)
+
+#Actual rate changes for each press conference
+next.mtg.rate_pc <- left_join(next.month_pc, eff.rate.change, by = "date") %>% slice(1:15)
+
+```
+
+
+
+```{r, echo = FALSE}
+#Using the model to predict based on word counts in press conference transcripts and minutes
+
+press.conf.words <- data.frame(as.matrix(dtm.press.conf)) %>% 
+  select(weak, expand, aggress, sharp, wors, robust)
+
+minutes.words <- data.frame(as.matrix(dtm.minutes)) %>% 
+  select(weak, expand, aggress, sharp, robust)
+
+#Special model fit for minutes - wors does not show up in DTM.
+rates.minutes <- lm(data = reg.df, change ~ -1 + weak + expand + aggress + sharp + robust)
+
+#Predictions
+pred.pc <- predict(rates, press.conf.words) %>% data.frame() %>% slice(1:15)
+pred.minutes <- predict(rates.minutes, minutes.words) %>% data.frame() %>% slice(1:40)
+
+
+#Visualizations
+compare.pc <- bind_cols(next.mtg.rate_pc, pred.pc) %>% 
+  rename(., pred.change = `.`) %>%
+  mutate(pred.off = change - pred.change)
+
+ggplot(compare.pc, aes(x = date, y = pred.off)) +
+  geom_point() +
+  geom_hline(yintercept = 0) +
+  xlab("Date") +
+  ylab("Prediction Accuracy (%)")
+
+
+```
+
+The model predicted rate changes fairly well using press conference transcripts. Most predictions were close to the actual rate change, with only 5 being more than 0.025% away from the actual rate change.
+
+Let's also predict using the minutes data:
+
+```{r, echo = FALSE}
+
+compare.minutes <- bind_cols(next.mtg.rate_minutes, pred.minutes) %>% 
+  rename(., pred.change = `.`) %>%
+  mutate(pred.off = change - pred.change)
+
+ggplot(compare.minutes, aes(x = date, y = pred.off)) +
+  geom_point() +
+  geom_hline(yintercept = 0) +
+  xlab("Date") +
+  ylab("Prediction Accuracy (%)")
+
+
+```
+
+The minute predictions were not nearly as close as the press conference data. The model over-estimated the rate change in most instances by a large margin. This may be because the minutes are not raw spoken word, but rather a summary that has been typed up for presentation. 
+
+##Limitations and Conclusion
+
+The model fit better than expected for the press conference transcripts. Two items worked against it - the model was not specifically trained on press conference transcripts but rather meeting transcripts, and the model was not trained in the current interest rate climate where rates have been at all time lows for nearly six years. Besides these limitations, the model managed to get within 0.025% of the true rate change for more than half of the press conferences. This is particularly astonishing when considering how simple the model is and how complex the phenomena the model is attempting to represent is. 
+
+Obvious improvements can be made, as evidenced by the error in predicting rate changes based on minutes. The model could be trained on the minutes of FOMC meetings rather than the transcripts, and used to predict rate changes using word frequencies in minutes. Likewise, the model could be trained on press conference releases instead, or some combination of all three sources. While the purpose of the model is to go right to the source of rate changes, rather than considering variables the decision makers use in setting rates, further knowledge of monetary policy and what goes into setting target interest rates would likely aid the model . Lastly, incorporating [sentiment analysis](https://trinker.github.io/qdap/) and [latent semantic analysis](http://www.ncbi.nlm.nih.gov/pubmed/25425391) using the qdap and lsa R packages would likely improve the model by moving it past only word frequencies as predictor variables. 
+
